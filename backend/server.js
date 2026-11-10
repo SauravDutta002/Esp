@@ -134,6 +134,10 @@ function page() {
         <span class="dot ${d.online ? "on" : "off"}">${d.online ? "online" : "offline"}</span>
       </div>
       <a class="ip" href="http://${esc(d.ip)}" target="_blank" rel="noopener">${esc(d.ip)}</a>
+      <div class="btns">
+        <button class="btn pri" data-open="${esc(d.ip)}">Open in Chrome</button>
+        <button class="btn" data-copy="${esc(d.ip)}">Copy IP</button>
+      </div>
       <div class="meta">
         Wi-Fi ${esc(d.ssid || "?")}${d.rssi ? " (" + esc(d.rssi) + " dBm)" : ""}
         · Bluetooth ${d.ble ? "paired" : "not paired"}
@@ -149,7 +153,6 @@ function page() {
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30">
 <title>Paste Link Devices</title>
 <style>
   :root{--bg:#fff;--fg:#111;--muted:#666;--line:#ddd;--on:#1e9e55;--off:#999}
@@ -166,12 +169,68 @@ function page() {
   .ip{display:block;font-size:26px;font-weight:600;color:var(--fg);margin:8px 0;text-decoration:none;font-variant-numeric:tabular-nums}
   .meta{font-size:12px;color:var(--muted);margin-top:4px}
   .empty{color:var(--muted)}
+  .btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 10px}
+  .btn{padding:12px;border-radius:10px;font-size:15px;font-weight:600;font-family:inherit;cursor:pointer;
+       background:transparent;color:var(--fg);border:1px solid var(--line)}
+  .btn.pri{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+  .btn.done{color:var(--on);border-color:var(--on)}
 </style></head>
 <body><div class="wrap">
   <h1>Paste Link devices</h1>
-  <div class="sub">Tap an address to open that ESP32 (your phone must be on the same Wi-Fi). Refreshes every 30 s.</div>
+  <div class="sub">Open needs your phone on the same Wi-Fi as the ESP32. Refreshes every 30 s.</div>
   ${cards}
-</div></body></html>`;
+</div>
+<script>
+var ua = navigator.userAgent;
+var isAndroid = /Android/i.test(ua);
+var isIOS = /iPhone|iPad|iPod/i.test(ua);
+
+function openInChrome(ip) {
+  if (isAndroid) {
+    // Opens Chrome directly; falls back to the normal page if Chrome is missing.
+    location.href = "intent://" + ip + "/#Intent;scheme=http;package=com.android.chrome;" +
+      "S.browser_fallback_url=" + encodeURIComponent("http://" + ip + "/") + ";end";
+  } else if (isIOS) {
+    location.href = "googlechrome://" + ip + "/";
+  } else {
+    window.open("http://" + ip + "/", "_blank");
+  }
+}
+
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  return new Promise(function (ok, fail) {
+    var t = document.createElement("textarea");
+    t.value = text; t.style.position = "fixed"; t.style.opacity = "0";
+    document.body.appendChild(t); t.select();
+    try { document.execCommand("copy") ? ok() : fail(); } catch (e) { fail(e); }
+    document.body.removeChild(t);
+  });
+}
+
+var busyUntil = 0;
+document.addEventListener("click", function (e) {
+  var b = e.target.closest("button");
+  if (!b) return;
+  busyUntil = Date.now() + 5000;
+  if (b.dataset.open) openInChrome(b.dataset.open);
+  if (b.dataset.copy) {
+    copyText(b.dataset.copy).then(function () {
+      b.textContent = "Copied!"; b.classList.add("done");
+    }, function () {
+      b.textContent = "Copy failed";
+    }).then(function () {
+      setTimeout(function () { b.textContent = "Copy IP"; b.classList.remove("done"); }, 1500);
+    });
+  }
+});
+
+// Refresh every 30 s, but not right after a tap.
+setInterval(function () {
+  if (Date.now() > busyUntil && document.visibilityState === "visible") location.reload();
+}, 30000);
+</script>
+</body></html>`;
 }
 
 // ---------- server ----------

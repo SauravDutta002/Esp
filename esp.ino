@@ -33,8 +33,8 @@ const char* BT_NAME   = "Paste Link";     // name shown in laptop Bluetooth
 
 // ---------- IP registry (backend/ folder, hosted on Render) ----------
 const char* DEVICE_NAME  = "saurav esp ip";                     // change this for each new ESP32
-const char* BACKEND_URL  = "https://YOUR-APP.onrender.com";     // your Render URL, no trailing /
-const char* DEVICE_TOKEN = "change-me-to-a-long-secret";        // same as DEVICE_TOKEN on Render
+const char* BACKEND_URL  = "https://esp-1-5o0g.onrender.com";   // your Render URL
+const char* DEVICE_TOKEN = "esp-0c65d4a404edc71398571f87";        // same as DEVICE_TOKEN on Render
 const unsigned long REPORT_EVERY_MS = 5UL * 60 * 1000;          // re-report every 5 min
 const unsigned long REPORT_RETRY_MS = 30UL * 1000;              // retry after a failure
 
