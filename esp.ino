@@ -1,13 +1,18 @@
-
-
 /*
   Paste Link  -  Seeed Studio XIAO ESP32-C3
   Phone -> WiFi -> ESP32 -> Bluetooth -> Laptop        (type on laptop)
-  Laptop script -> WiFi -> ESP32 -> Phone page         (selected text, automatic)
-  Phone page -> Gemini API (your key, stored on the phone only) -> reply
+  Laptop script -> WiFi -> ESP32 -> Phone page         (selected text + commands)
+  Phone page -> Gemini or Claude (your key, stored on the phone only) -> reply
   -> typed on the laptop through the ESP32.
 
-  The page is served as 3 small files: /  /core.js  /gemini.js
+  Laptop script commands (POST /p):
+    t=...      set the "From laptop" text
+    clear=1    empty the "From laptop" box
+    ask=1      phone asks the AI now                (G key)
+    stop=1     stop typing / cancel the AI request  (F9 key)
+    newchat=1  phone forgets the conversation       (M key)
+
+  The page is served as 3 small files: /  /core.js  /ai.js
 
   Needs: HijelHID_BLEKeyboard + NimBLE-Arduino (2.3.8 or newer)
   Board: XIAO_ESP32C3, USB CDC On Boot: Enabled
@@ -16,6 +21,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <HijelHID_BLEKeyboard.h>
 
 // ---------- Settings ----------
@@ -24,11 +31,19 @@ const char* WIFI_PASS = "123456789";
 const char* HOST_NAME = "paste";          // http://paste.local
 const char* BT_NAME   = "Paste Link";     // name shown in laptop Bluetooth
 
+// ---------- IP registry (backend/ folder, hosted on Render) ----------
+const char* DEVICE_NAME  = "saurav esp ip";                     // change this for each new ESP32
+const char* BACKEND_URL  = "https://YOUR-APP.onrender.com";     // your Render URL, no trailing /
+const char* DEVICE_TOKEN = "change-me-to-a-long-secret";        // same as DEVICE_TOKEN on Render
+const unsigned long REPORT_EVERY_MS = 5UL * 60 * 1000;          // re-report every 5 min
+const unsigned long REPORT_RETRY_MS = 30UL * 1000;              // retry after a failure
+
 const uint8_t STATIC_HOST = 150;          // fixed address <subnet>.150, 0 = plain DHCP
 
 const bool   CLEAR_BONDS = false;         // true for ONE flash to forget old pairings
 const size_t MAX_CHUNK   = 2048;          // max characters per typing request
 const size_t MAX_RX      = 20000;         // max characters accepted from the laptop
+const unsigned long STOP_HOLD_MS = 1500;  // after a stop, typing requests are refused this long
 
 HijelHID_BLEKeyboard keyboard(BT_NAME, "ESP32", 100);
 WebServer server(80);
@@ -36,6 +51,17 @@ WebServer server(80);
 // Text received from the laptop script
 String        latestText;
 unsigned long latestId = 0;
+
+// Commands from the laptop script, kept in a small ring so none are lost
+const int     CMD_SLOTS = 8;
+String        cmdName[CMD_SLOTS];
+unsigned long cmdIdOf[CMD_SLOTS];
+unsigned long cmdId = 0;
+
+unsigned long stopAt = 0;                 // millis() of the last stop, 0 = none
+unsigned long lastTypeAt = 0;             // millis() of the last typing request
+unsigned long nextReportAt = 0;
+IPAddress     reportedIp;
 
 // =====================================================================
 //  FILE 1: the page (HTML + CSS)
@@ -61,14 +87,15 @@ window.onerror=function(m,s,l){
   .wrap{max-width:560px;margin:0 auto}
   header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:10px}
   h1{font-size:20px;margin:0;font-weight:600}
-  h2{font-size:15px;margin:30px 0 10px;font-weight:600;color:#ccc}
+  h2{font-size:15px;margin:30px 0 10px;font-weight:600;color:#ccc;display:flex;justify-content:space-between;align-items:center}
+  h2 small{font-weight:400;color:#888;font-size:12px}
   #st{font-size:13px;color:#888;text-align:right}
   #st.ok{color:#2ecc71}
-  textarea,input[type=text],input[type=password]{
+  textarea,input[type=text],input[type=password],select{
     width:100%;font-size:16px;line-height:1.45;padding:12px;border-radius:10px;border:1px solid #333;
     background:#000;color:#fff;outline:none;font-family:inherit}
   textarea{height:200px;resize:vertical}
-  textarea:focus,input:focus{border-color:#fff}
+  textarea:focus,input:focus,select:focus{border-color:#fff}
   #rx{height:170px}
   #ans{height:200px}
   #sys{height:110px}
@@ -89,6 +116,7 @@ window.onerror=function(m,s,l){
   .good{color:#2ecc71!important}.warn{color:#f1c40f!important}.err{color:#e74c3c!important}
   details{border:1px solid #333;border-radius:10px;padding:4px 12px;margin-top:12px}
   summary{padding:10px 0;font-size:14px;color:#ccc;cursor:pointer}
+  .hide{display:none}
 </style>
 </head>
 <body>
@@ -113,37 +141,61 @@ window.onerror=function(m,s,l){
   <div class="msg" id="msg"></div>
 
   <h2>From laptop</h2>
-  <div class="lbl">Select text on the laptop and press X. It is added here.</div>
+  <div class="lbl">Select text on the laptop, then X = add, G = ask AI, M = new chat, F9 = stop.</div>
   <textarea id="rx" readonly placeholder="Selected text appears here"></textarea>
   <div class="msg" id="rmsg"></div>
 
-  <h2>Gemini</h2>
+  <h2>AI <small id="chatinfo">New chat</small></h2>
   <details id="settings">
     <summary>Settings</summary>
-    <div class="lbl">API key (saved on this phone only)</div>
-    <input type="password" id="gkey" placeholder="Paste your Gemini API key" autocomplete="off">
-    <div class="lbl">Model (change it if you get a "model not found" error)</div>
-    <input type="text" id="gmodel" autocapitalize="off" autocomplete="off" spellcheck="false">
-    <div class="lbl">Instructions for Gemini</div>
+    <div class="lbl">Provider</div>
+    <select id="prov">
+      <option value="gemini">Gemini (Google)</option>
+      <option value="claude">Claude (Anthropic)</option>
+    </select>
+
+    <div id="gbox">
+      <div class="lbl">Gemini API key (saved on this phone only)</div>
+      <input type="password" id="gkey" placeholder="Paste your Gemini API key" autocomplete="off">
+      <div class="lbl">Gemini model</div>
+      <input type="text" id="gmodel" autocapitalize="off" autocomplete="off" spellcheck="false">
+    </div>
+
+    <div id="cbox" class="hide">
+      <div class="lbl">Claude API key (saved on this phone only)</div>
+      <input type="password" id="ckey" placeholder="sk-ant-..." autocomplete="off">
+      <div class="lbl">Claude model (claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5)</div>
+      <input type="text" id="cmodel" autocapitalize="off" autocomplete="off" spellcheck="false">
+      <div class="lbl">Effort (lower = faster and cheaper)</div>
+      <select id="ceff">
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+    </div>
+
+    <div class="lbl">Instructions for the AI</div>
     <textarea id="sys" autocapitalize="off" spellcheck="false"></textarea>
+    <label class="sw"><input type="checkbox" id="mem" checked> Remember the conversation (follow-up questions)</label>
   </details>
 
-  <label class="sw"><input type="checkbox" id="aa"> Ask Gemini automatically 3 s after new text arrives</label>
+  <label class="sw"><input type="checkbox" id="aa"> Ask automatically 3 s after new text arrives</label>
   <label class="sw"><input type="checkbox" id="at" checked> Type the reply on the laptop automatically</label>
   <label class="sw"><input type="checkbox" id="cl" checked> Clean the reply (no markdown, ASCII only)</label>
   <div class="lbl">Wait before typing: <span id="wv">4</span> s (time to click where the answer should go)</div>
   <input type="range" id="wait" min="0" max="15" value="4">
 
   <div class="two">
-    <button class="pri" id="ask">Ask Gemini</button>
+    <button class="pri" id="ask">Ask AI</button>
     <button class="sec" id="again">Type reply again</button>
   </div>
-  <textarea id="ans" placeholder="Gemini's reply appears here" style="margin-top:10px"></textarea>
+  <button class="sec" id="newchat">New chat</button>
+  <textarea id="ans" placeholder="The reply appears here" style="margin-top:10px"></textarea>
   <div class="msg" id="gmsg"></div>
 </div>
 
-<script src="/core.js?v=3"></script>
-<script src="/gemini.js?v=3"></script>
+<script src="/core.js?v=4"></script>
+<script src="/ai.js?v=4"></script>
 <script>
 setTimeout(function(){
   if(!window.coreLoaded){
@@ -157,12 +209,12 @@ setTimeout(function(){
 )HTML";
 
 // =====================================================================
-//  FILE 2: /core.js  (typing, status, laptop box; no Gemini code)
+//  FILE 2: /core.js  (typing, status, laptop box, laptop commands)
 // =====================================================================
 const char JS_CORE[] PROGMEM = R"JS(
 window.coreLoaded=true;
 var $=function(id){return document.getElementById(id);};
-var typing=false, stopReq=false, wake=null, lastId=0;
+var typing=false, stopReq=false, wake=null, lastId=0, lastCmd=-1;
 
 function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
 function say(m,c){var e=$('msg');e.textContent=m;e.className='msg '+(c||'');}
@@ -210,9 +262,13 @@ function ui(on){
   if(on)$('stop').textContent='STOP';
 }
 
-$('stop').onclick=function(){
+function requestStop(){
   stopReq=true;
   $('stop').textContent='Stopping...';
+  if(window.onStop) window.onStop();
+}
+$('stop').onclick=function(){
+  requestStop();
   fetch('/stop',{method:'POST'}).catch(function(){});
 };
 
@@ -241,6 +297,7 @@ async function typeOnLaptop(text,enter,waitSec){
     try{
       var r=await fetch('/type',{method:'POST',body:body});
       var m=await r.text();
+      if(m.indexOf('Stopped')===0){stopReq=true;break;}
       if(m.indexOf('Done')!==0){ok=false;errMsg=m;break;}
     }catch(e){ok=false;errMsg='Lost connection to the ESP32.';break;}
     pos+=part.length;
@@ -262,73 +319,175 @@ $('go').onclick=function(){
   typeOnLaptop(text,$('en').checked,0);
 };
 
-// Laptop -> phone (automatic)
-async function pollRx(){
-  if(typing) return;
+// Laptop -> phone text. force=true fetches it even if nothing changed.
+async function pollRx(force){
+  if(typing && !force) return;
   try{
-    var r=await fetch('/latest?since='+lastId);
+    var r=await fetch('/latest?since='+(force?0:lastId));
     if(r.status===200){
       var txt=await r.text();
+      var id=parseInt(r.headers.get('X-Id'))||lastId;
+      var changed=id!==lastId;
       $('rx').value=txt;
       $('rx').scrollTop=$('rx').scrollHeight;
-      lastId=parseInt(r.headers.get('X-Id'))||lastId;
-      rsay(txt?('Updated '+new Date().toLocaleTimeString()):'Cleared.',txt?'good':'warn');
-      if(txt && window.onNewText) window.onNewText(txt);
+      lastId=id;
+      if(changed){
+        rsay(txt?('Updated '+new Date().toLocaleTimeString()):'Cleared.',txt?'good':'warn');
+        if(txt && !force && window.onNewText) window.onNewText(txt);
+      }
     }
   }catch(e){}
 }
-setInterval(pollRx,700);pollRx();
+window.syncRx=function(){return pollRx(true);};
+setInterval(function(){pollRx(false);},700);pollRx(false);
+
+// Laptop commands (ask / stop / newchat). Runs even while typing so F9 works.
+var cmdBusy=false;
+async function pollCmd(){
+  if(cmdBusy) return;
+  cmdBusy=true;
+  try{
+    var r=await fetch('/cmd?since='+Math.max(lastCmd,0));
+    var id=parseInt(r.headers.get('X-Id'));
+    if(lastCmd<0){ lastCmd=isNaN(id)?0:id; }      // first load: skip old commands
+    else if(r.status===200){
+      var lines=(await r.text()).split('\n');
+      for(var i=0;i<lines.length;i++){
+        var p=lines[i].split(' ');
+        var cid=parseInt(p[0]), name=p[1];
+        if(!cid || cid<=lastCmd) continue;
+        lastCmd=cid;
+        if(name==='stop'){ if(typing) requestStop(); else if(window.onStop) window.onStop(); }
+        else if(window.onCmd) window.onCmd(name);
+      }
+    }
+  }catch(e){}
+  cmdBusy=false;
+}
+setInterval(pollCmd,400);pollCmd();
 info();
 )JS";
 
 // =====================================================================
-//  FILE 3: /gemini.js  (separate, so a problem here cannot break typing)
+//  FILE 3: /ai.js  (Gemini + Claude; separate, so a problem here cannot break typing)
 // =====================================================================
-const char JS_GEMINI[] PROGMEM = R"JS(
+const char JS_AI[] PROGMEM = R"JS(
 (function(){
 try{
   var G=function(id){return document.getElementById(id);};
   function store(k,v){try{localStorage.setItem(k,v);}catch(e){}}
   function load(k,d){try{var v=localStorage.getItem(k);return v===null?d:v;}catch(e){return d;}}
   function gsay(m,c){var e=G('gmsg');e.textContent=m;e.className='msg '+(c||'');}
-  var working=false, askTimer=null;
+  var working=false, askTimer=null, ctrl=null;
+  var MAX_TURNS=40;
 
-  G('gkey').value=load('gkey','');
-  G('gmodel').value=load('gmodel','gemini-2.5-flash');
-  G('sys').value=load('gsys','Answer concisely in plain text only. Use only standard ASCII characters. No markdown, no bullet symbols, no code fences. If the task asks for code, output only the code.');
-  G('aa').checked=load('aa','0')==='1';
-  G('at').checked=load('at','1')==='1';
-  G('cl').checked=load('cl','1')==='1';
+  // ----- settings -----
+  var fields={prov:'gemini',gkey:'',gmodel:'gemini-2.5-flash',ckey:'',cmodel:'claude-opus-5-5',ceff:'low',
+    sys:'Answer concisely in plain text only. Use only standard ASCII characters. No markdown, no bullet symbols, no code fences. If the task asks for code, output only the code.'};
+  Object.keys(fields).forEach(function(k){
+    G(k).value=load(k==='sys'?'gsys':k,fields[k]);
+    G(k).oninput=G(k).onchange=function(){
+      store(k==='sys'?'gsys':k,(k==='sys'||k==='prov'||k==='ceff')?G(k).value:G(k).value.trim());
+      if(k==='prov') showProv();
+    };
+  });
+  var checks={aa:'0',at:'1',cl:'1',mem:'1'};
+  Object.keys(checks).forEach(function(k){
+    G(k).checked=load(k,checks[k])==='1';
+    G(k).onchange=function(){store(k,G(k).checked?'1':'0');};
+  });
   G('wait').value=load('wait','4');G('wv').textContent=G('wait').value;
-  G('gkey').oninput=function(){store('gkey',G('gkey').value.trim());};
-  G('gmodel').oninput=function(){store('gmodel',G('gmodel').value.trim());};
-  G('sys').oninput=function(){store('gsys',G('sys').value);};
-  G('aa').onchange=function(){store('aa',G('aa').checked?'1':'0');};
-  G('at').onchange=function(){store('at',G('at').checked?'1':'0');};
-  G('cl').onchange=function(){store('cl',G('cl').checked?'1':'0');};
   G('wait').oninput=function(){G('wv').textContent=G('wait').value;store('wait',G('wait').value);};
-  if(!G('gkey').value) G('settings').open=true;
 
-  async function askGemini(prompt){
+  function showProv(){
+    var c=G('prov').value==='claude';
+    G('gbox').className=c?'hide':'';
+    G('cbox').className=c?'':'hide';
+  }
+  showProv();
+  function keyMissing(){return !(G('prov').value==='claude'?G('ckey'):G('gkey')).value.trim();}
+  if(keyMissing()) G('settings').open=true;
+
+  // ----- chat memory: [{role:'user'|'assistant', text, raw?}] -----
+  var hist=[];
+  try{hist=JSON.parse(load('hist','[]'))||[];}catch(e){hist=[];}
+  function saveHist(){
+    if(hist.length>MAX_TURNS) hist=hist.slice(hist.length-MAX_TURNS);
+    while(hist.length && hist[0].role!=='user') hist.shift();
+    store('hist',JSON.stringify(hist));
+    var n=Math.floor(hist.length/2);
+    G('chatinfo').textContent=n?('Chat: '+n+' question'+(n>1?'s':'')):'New chat';
+  }
+  saveHist();
+  function newChat(){
+    hist=[];saveHist();G('ans').value='';
+    gsay('New chat started. The AI forgot the earlier questions.','good');
+  }
+  G('newchat').onclick=newChat;
+
+  // ----- providers -----
+  async function readJson(r){var j={};try{j=await r.json();}catch(e){}return j;}
+
+  async function askGemini(turns,sys,signal){
     var key=G('gkey').value.trim();
     var model=G('gmodel').value.trim()||'gemini-2.5-flash';
     if(!key) throw new Error('Open Settings and paste your Gemini API key.');
-    var body={contents:[{role:'user',parts:[{text:prompt}]}]};
-    var sys=G('sys').value.trim();
+    var body={contents:turns.map(function(t){
+      return {role:t.role==='assistant'?'model':'user',parts:[{text:t.text}]};
+    })};
     if(sys) body.systemInstruction={parts:[{text:sys}]};
     var r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent',{
-      method:'POST',
+      method:'POST',signal:signal,
       headers:{'Content-Type':'application/json','x-goog-api-key':key},
       body:JSON.stringify(body)
     });
-    var j={};
-    try{j=await r.json();}catch(e){}
+    var j=await readJson(r);
     if(!r.ok) throw new Error((j.error&&j.error.message)||('Gemini error '+r.status));
     var c=j.candidates&&j.candidates[0];
     var parts=c&&c.content&&c.content.parts;
     var text=parts?parts.map(function(p){return p.text||'';}).join(''):'';
     if(!text) throw new Error('Gemini returned no text'+(j.promptFeedback&&j.promptFeedback.blockReason?' (blocked: '+j.promptFeedback.blockReason+')':'.'));
-    return text;
+    return {text:text};
+  }
+
+  async function askClaude(turns,sys,signal){
+    var key=G('ckey').value.trim();
+    var model=G('cmodel').value.trim()||'claude-opus-5-5';
+    if(!key) throw new Error('Open Settings and paste your Claude API key.');
+    var body={
+      model:model,
+      max_tokens:16000,
+      output_config:{effort:G('ceff').value||'low'},
+      messages:turns.map(function(t){
+        return {role:t.role,content:(t.role==='assistant'&&t.raw)?t.raw:t.text};
+      })
+    };
+    if(sys) body.system=sys;
+    var headers={
+      'content-type':'application/json',
+      'x-api-key':key,
+      'anthropic-version':'2026-10-21',
+      'anthropic-dangerous-direct-browser-access':'true'
+    };
+    // If this model declines a request, let Anthropic retry it on another model automatically.
+    if(/^claude-(opus-5|sonnet-5-5|fable-5)/.test(model)){
+      body.fallbacks='default';
+      headers['anthropic-beta']='server-side-fallback-2026-07-01';
+    }
+    var r=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',signal:signal,headers:headers,body:JSON.stringify(body)
+    });
+    var j=await readJson(r);
+    if(!r.ok) throw new Error((j.error&&j.error.message)||('Claude error '+r.status));
+    if(j.stop_reason==='refusal'){
+      var why=j.stop_details&&j.stop_details.explanation;
+      throw new Error('Claude declined this request'+(why?': '+why:'.'));
+    }
+    var blocks=j.content||[];
+    var text=blocks.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('');
+    if(!text) throw new Error('Claude returned no text.');
+    if(j.stop_reason==='max_tokens') text+='\n[reply cut off]';
+    return {text:text,raw:blocks};
   }
 
   function clean(s){
@@ -336,52 +495,85 @@ try{
       .replace(/```[a-zA-Z0-9_+-]*\n?/g,'')
       .replace(/\*\*/g,'')
       .replace(/^#+\s*/gm,'')
-      .replace(/[\u2018\u2019]/g,"'").replace(/[\u201C\u201D]/g,'"')
-      .replace(/[\u2013\u2014]/g,'-').replace(/\u2026/g,'...').replace(/\u00A0/g,' ')
+      .replace(/[‘’]/g,"'").replace(/[“”]/g,'"')
+      .replace(/[–—]/g,'-').replace(/…/g,'...').replace(/ /g,' ')
+      .replace(/•/g,'-')
       .replace(/[^\x09\x0A\x0D\x20-\x7E]/g,'')
       .trim();
   }
 
-  async function runAsk(){
+  // ----- ask -----
+  async function runAsk(fromLaptop){
     if(working||typing) return;
-    var q=G('rx').value.trim();
-    if(!q){gsay('Nothing to ask yet. Select text on the laptop and press X.','warn');return;}
+    clearTimeout(askTimer);
     working=true;G('ask').disabled=true;
-    gsay('Asking Gemini...');
     try{
-      var a=await askGemini(q);
-      if(G('cl').checked) a=clean(a);
+      if(fromLaptop && window.syncRx) await window.syncRx();   // make sure the newest text is here
+      var q=G('rx').value.trim();
+      if(!q){gsay('Nothing to ask yet. Select text on the laptop and press X or G.','warn');return;}
+
+      var prov=G('prov').value;
+      var name=prov==='claude'?'Claude':'Gemini';
+      var turns=(G('mem').checked?hist.slice():[]).concat([{role:'user',text:q}]);
+      ctrl=('AbortController' in window)?new AbortController():null;
+      gsay('Asking '+name+(turns.length>1?' (with '+Math.floor(turns.length/2)+' earlier questions)':'')+'...');
+
+      var res=await (prov==='claude'?askClaude:askGemini)(turns,G('sys').value.trim(),ctrl&&ctrl.signal);
+      ctrl=null;
+
+      hist.push({role:'user',text:q});
+      hist.push({role:'assistant',text:res.text,raw:res.raw});
+      saveHist();
+
+      var a=G('cl').checked?clean(res.text):res.text;
       G('ans').value=a;
-      gsay('Reply received ('+a.length.toLocaleString()+' characters).','good');
-      if(G('at').checked) await typeOnLaptop(a,G('en').checked,parseInt(G('wait').value)||0);
+      gsay(name+' replied ('+a.length.toLocaleString()+' characters).','good');
+      if(G('at').checked){
+        working=false;G('ask').disabled=false;
+        await typeOnLaptop(a,G('en').checked,parseInt(G('wait').value)||0);
+      }
     }catch(e){
-      gsay(e.message||'Request failed.','err');
+      if(e&&e.name==='AbortError') gsay('Cancelled.','warn');
+      else gsay((e&&e.message)||'Request failed.','err');
+    }finally{
+      ctrl=null;working=false;G('ask').disabled=false;
     }
-    working=false;G('ask').disabled=false;
   }
-  G('ask').onclick=runAsk;
+  G('ask').onclick=function(){runAsk(false);};
   G('again').onclick=function(){
     var a=G('ans').value;
     if(!a){gsay('No reply to type yet.','warn');return;}
     typeOnLaptop(a,G('en').checked,parseInt(G('wait').value)||0);
   };
 
-  // called by core.js whenever new text arrives from the laptop
+  // ----- hooks called by core.js -----
   window.onNewText=function(){
     if(G('aa').checked){
       clearTimeout(askTimer);
-      gsay('New text. Asking Gemini in 3 s (more text restarts the timer)...','warn');
-      askTimer=setTimeout(runAsk,3000);
+      gsay('New text. Asking in 3 s (more text restarts the timer)...','warn');
+      askTimer=setTimeout(function(){runAsk(false);},3000);
     }
+  };
+  window.onStop=function(){
+    clearTimeout(askTimer);
+    if(ctrl){ctrl.abort();}
+  };
+  window.onCmd=function(name){
+    if(name==='ask') runAsk(true);
+    else if(name==='newchat'){ if(ctrl) ctrl.abort(); clearTimeout(askTimer); newChat(); }
   };
 }catch(e){
   var m=document.getElementById('gmsg');
-  if(m){m.textContent='Gemini script error: '+e.message;m.className='msg err';}
+  if(m){m.textContent='AI script error: '+e.message;m.className='msg err';}
 }
 })();
 )JS";
 
 // ---------- Typing ----------
+bool stoppedRecently() {
+  return stopAt != 0 && millis() - stopAt < STOP_HOLD_MS;
+}
+
 void typeText(const String& text, int delayMs, bool pressEnter) {
   keyboard.setTapDelay(delayMs);   // how long each key is held
   keyboard.setKeyGap(delayMs);     // gap after each key
@@ -400,6 +592,14 @@ void typeText(const String& text, int delayMs, bool pressEnter) {
   keyboard.releaseAll();
 }
 
+void pushCmd(const char* name) {
+  cmdId++;
+  int slot = cmdId % CMD_SLOTS;
+  cmdName[slot] = name;
+  cmdIdOf[slot] = cmdId;
+  Serial.printf("Command %lu: %s\n", cmdId, name);
+}
+
 // ---------- Handlers ----------
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-store");
@@ -411,9 +611,9 @@ void handleCoreJs() {
   server.send_P(200, "application/javascript", JS_CORE);
 }
 
-void handleGeminiJs() {
+void handleAiJs() {
   server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "application/javascript", JS_GEMINI);
+  server.send_P(200, "application/javascript", JS_AI);
 }
 
 void handleStatus() {
@@ -424,6 +624,10 @@ void handleStatus() {
 
 // Called once per chunk by the phone page
 void handleType() {
+  if (stoppedRecently()) {
+    server.send(200, "text/plain", "Stopped.");
+    return;
+  }
   if (!keyboard.isPaired()) {
     server.send(200, "text/plain", "Laptop not connected over Bluetooth.");
     return;
@@ -441,7 +645,9 @@ void handleType() {
   int  delayMs = constrain(server.arg("delay").toInt(), 1, 200);
   bool enter   = server.arg("enter") == "1";
 
+  lastTypeAt = millis();
   typeText(text, delayMs, enter);
+  lastTypeAt = millis();
   server.send(200, "text/plain", "Done. Typed " + String(text.length()) + " characters.");
 }
 
@@ -450,13 +656,35 @@ void handleStop() {
   server.send(200, "text/plain", "Stopped.");
 }
 
-// The laptop script posts selected text here (t=...) or empties the box (clear=1)
+// The laptop script posts here: t=... | clear=1 | ask=1 | stop=1 | newchat=1
 void handlePush() {
+  if (server.arg("stop") == "1") {
+    keyboard.releaseAll();
+    stopAt = millis();
+    if (stopAt == 0) stopAt = 1;
+    pushCmd("stop");
+    server.send(200, "text/plain", "ok");
+    return;
+  }
+  if (server.arg("ask") == "1") {
+    pushCmd("ask");
+    server.send(200, "text/plain", "ok");
+    return;
+  }
+  if (server.arg("newchat") == "1") {
+    pushCmd("newchat");
+    server.send(200, "text/plain", "ok");
+    return;
+  }
   if (server.arg("clear") == "1") {
     latestText = "";
     latestId++;
     Serial.println("Cleared by laptop.");
     server.send(200, "text/plain", "ok");
+    return;
+  }
+  if (!server.hasArg("t")) {
+    server.send(400, "text/plain", "Unknown request.");
     return;
   }
   String text = server.arg("t");
@@ -480,6 +708,80 @@ void handleLatest() {
     return;
   }
   server.send(200, "text/plain; charset=utf-8", latestText);
+}
+
+// The phone page polls this for laptop commands. Body: one "id name" per line.
+void handleCmd() {
+  unsigned long since = strtoul(server.arg("since").c_str(), nullptr, 10);
+  server.sendHeader("X-Id", String(cmdId));
+  if (cmdId == 0 || since >= cmdId) {
+    server.send(204, "text/plain", "");
+    return;
+  }
+  String out;
+  unsigned long first = (cmdId > CMD_SLOTS) ? cmdId - CMD_SLOTS + 1 : 1;
+  if (since + 1 > first) first = since + 1;
+  for (unsigned long id = first; id <= cmdId; id++) {
+    int slot = id % CMD_SLOTS;
+    if (cmdIdOf[slot] == id) out += String(id) + " " + cmdName[slot] + "\n";
+  }
+  server.send(200, "text/plain", out);
+}
+
+// ---------- IP registry ----------
+String jsonEsc(const String& s) {
+  String o;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if ((uint8_t)c < 32) o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+bool reportIp() {
+  String base = BACKEND_URL;
+  if (base.indexOf("YOUR-APP") >= 0) return true;        // not set up yet: skip quietly
+  while (base.endsWith("/")) base.remove(base.length() - 1);
+
+  WiFiClientSecure tls;
+  tls.setInsecure();                 // no certificate check: only a LAN IP is sent
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(10000);            // Render's free plan can take a while to wake up
+  if (!http.begin(tls, base + "/api/report")) {
+    Serial.println("Registry: bad BACKEND_URL");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + DEVICE_TOKEN);
+
+  String body = String("{\"name\":\"") + jsonEsc(DEVICE_NAME) +
+                "\",\"ip\":\"" + WiFi.localIP().toString() +
+                "\",\"ssid\":\"" + jsonEsc(WiFi.SSID()) +
+                "\",\"rssi\":" + String(WiFi.RSSI()) +
+                ",\"mac\":\"" + WiFi.macAddress() +
+                "\",\"ble\":" + (keyboard.isPaired() ? "true" : "false") +
+                ",\"uptime\":" + String(millis() / 1000) + "}";
+
+  int code = http.POST(body);
+  http.end();
+  Serial.printf("Registry: sent %s as \"%s\" -> %d\n",
+                WiFi.localIP().toString().c_str(), DEVICE_NAME, code);
+  return code == 200;
+}
+
+void maybeReport() {
+  unsigned long now = millis();
+  if (WiFi.localIP() != reportedIp) {          // just connected, or the address changed
+    reportedIp = WiFi.localIP();
+    nextReportAt = now;
+  }
+  if ((long)(now - nextReportAt) < 0) return;
+  if (lastTypeAt && now - lastTypeAt < 10000) return;   // don't pause in the middle of typing
+
+  nextReportAt = now + (reportIp() ? REPORT_EVERY_MS : REPORT_RETRY_MS);
 }
 
 // ---------- WiFi with fixed address ----------
@@ -550,14 +852,15 @@ void setup() {
 
   connectWiFi();
 
-  server.on("/",           HTTP_GET,  handleRoot);
-  server.on("/core.js",    HTTP_GET,  handleCoreJs);
-  server.on("/gemini.js",  HTTP_GET,  handleGeminiJs);
-  server.on("/status",     HTTP_GET,  handleStatus);
-  server.on("/type",       HTTP_POST, handleType);
-  server.on("/stop",       HTTP_POST, handleStop);
-  server.on("/p",          HTTP_POST, handlePush);
-  server.on("/latest",     HTTP_GET,  handleLatest);
+  server.on("/",         HTTP_GET,  handleRoot);
+  server.on("/core.js",  HTTP_GET,  handleCoreJs);
+  server.on("/ai.js",    HTTP_GET,  handleAiJs);
+  server.on("/status",   HTTP_GET,  handleStatus);
+  server.on("/type",     HTTP_POST, handleType);
+  server.on("/stop",     HTTP_POST, handleStop);
+  server.on("/p",        HTTP_POST, handlePush);
+  server.on("/latest",   HTTP_GET,  handleLatest);
+  server.on("/cmd",      HTTP_GET,  handleCmd);
   server.begin();
 }
 
@@ -574,4 +877,5 @@ void loop() {
     return;
   }
   server.handleClient();
+  maybeReport();
 }

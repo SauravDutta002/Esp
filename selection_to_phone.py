@@ -783,12 +783,13 @@
 Select text with the mouse, then press (right after selecting):
 
   X    add the selection to the phone
-  G    add the selection (if new) and send everything to Gemini.
-       The reply is typed on the laptop through the ESP32.
-  M    start a NEW chat (clears the phone box and Gemini's memory)
+  G    add the selection (if new) and ask the AI (Gemini or Claude, chosen on
+       the phone). The reply is typed on the laptop through the ESP32.
+       The AI remembers earlier questions until you press M.
+  M    start a NEW chat (clears the phone box and the AI's memory)
 
 Works any time:
-  F9   STOP typing / cancel the Gemini request
+  F9   STOP typing / cancel the AI request
   F8   pause / resume the keys above
 
 X, G and M are swallowed only right after a mouse selection. With nothing
@@ -864,18 +865,23 @@ def shorten_armed():
 
 
 # ---------- talking to the ESP32 ----------
-def post_esp(data):
-    """Try the last working address first, then the others."""
+def post_esp(data, timeout=2):
+    """Try the last working address first, then the others.
+    Returns the HTTP status code, or None if the ESP32 could not be reached."""
     global ESP
     order = [ESP] + [a for a in ESP_LIST if a != ESP]
     for addr in order:
         try:
-            r = requests.post(addr + "/p", data=data, timeout=2)
+            r = requests.post(addr + "/p", data=data, timeout=timeout)
             ESP = addr
             return r.status_code
         except Exception:
             continue
     return None
+
+
+def ok(code):
+    return code == 200
 
 
 # ---------- Method 1: direct read ----------
@@ -962,29 +968,46 @@ def do_send():
     if code is None:
         print("Send failed: ESP32 not reachable. Is the laptop on the 'IOT' hotspot?")
         return False
-    print(f"ADDED {len(text)} chars ({how}); phone now has {len(state['buffer'])} chars -> {code}")
+    if not ok(code):
+        print(f"Send failed: ESP32 answered {code}.")
+        return False
+    print(f"ADDED {len(text)} chars ({how}); phone now has {len(state['buffer'])} chars")
     return True
 
 
 def do_ask():
-    ok = do_send()                               # make sure the latest selection is included
-    if not ok:
+    if not do_send():                            # make sure the latest selection is included
         return
     code = post_esp({"ask": "1"})
-    print("ASKED Gemini." if code else "Ask failed: ESP32 not reachable.")
+    if ok(code):
+        # The question is on its way. The next X starts a new question; the AI
+        # still remembers this one (press M for a fresh chat).
+        state["buffer"] = ""
+        print("ASKED the AI. Next selection starts a new question.")
+    elif code is None:
+        print("Ask failed: ESP32 not reachable.")
+    else:
+        print(f"Ask failed: ESP32 answered {code}. Flash the new esp.ino.")
 
 
 def do_newchat():
     state["buffer"] = ""
     state["last_piece"] = ""
     post_esp({"clear": "1"})                     # empty the phone's selected-text box
-    code = post_esp({"newchat": "1"})            # wipe Gemini's memory on the phone
-    print("NEW CHAT started." if code else "New chat failed: ESP32 not reachable.")
+    code = post_esp({"newchat": "1"})            # wipe the AI's memory on the phone
+    if ok(code):
+        print("NEW CHAT started.")
+    else:
+        print("New chat failed:", "ESP32 not reachable." if code is None else f"ESP32 answered {code}.")
 
 
 def do_stop():
-    code = post_esp({"stop": "1"})
-    print("STOP sent." if code else "Stop failed: ESP32 not reachable.")
+    # The ESP32 can be busy typing a chunk for a few seconds, so wait longer here.
+    code = post_esp({"stop": "1"}, timeout=8)
+    if ok(code):
+        print("STOP sent.")
+    else:
+        print("Stop failed:", "ESP32 not reachable." if code is None else f"ESP32 answered {code}.")
 
 
 def worker():
@@ -1069,7 +1092,7 @@ def key_filter(msg, data):
 listener = keyboard.Listener(win32_event_filter=key_filter)
 
 if __name__ == "__main__":
-    print("Running. Select text, then: X = add, G = ask Gemini, M = new chat.")
+    print("Running. Select text, then: X = add, G = ask AI, M = new chat.")
     print("F9 = STOP typing (any time).  F8 = pause keys.")
     print("Target:", ESP)
     threading.Thread(target=worker, daemon=True).start()

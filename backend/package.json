@@ -1,0 +1,13 @@
+{
+  "name": "paste-link-backend",
+  "version": "1.0.0",
+  "description": "Registry where each Paste Link ESP32 reports its local IP address",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
