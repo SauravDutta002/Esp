@@ -1,0 +1,5 @@
+# API keys saved by laptop_ai.py
+ai_keys.json
+# saved chat (kept until you press New chat)
+chat_history.json
+__pycache__/
