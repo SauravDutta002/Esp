@@ -732,6 +732,19 @@ def wait_if_paused():
     while state["typing_paused"]:
         if stop_event.wait(0.1):
             return False
+    # A Ctrl / Alt / Win you are holding would turn the next typed letter into a shortcut
+    # (Ctrl+D, Ctrl+Alt+Up/Down, Alt+click = an extra cursor in VS Code / Monaco editors).
+    # Our own taps always release their modifiers, so anything held here is yours: wait.
+    warned = False
+    while held(0x11) or held(0x12) or held(0x5B) or held(0x5C):
+        if not warned:
+            log("Typing waits: let go of Ctrl / Alt / Win.", "warn")
+            warned = True
+        if stop_event.wait(0.05):
+            return False
+    if warned:
+        time.sleep(0.05)
+        log("Typing...  (F9 = stop)")
     return not stop_event.is_set()
 
 
@@ -1053,6 +1066,11 @@ def on_click(x, y, button, pressed):
                          "Resume typing or Space to continue.")
         if not state["click_ours"]:
             state["press"] = (x, y)
+            if state["typing"] and not state["typing_paused"]:
+                # A click in the target app moves the caret (Alt+click even adds a second
+                # cursor in code editors) while keys are still being sent: stop and wait.
+                pause_typing("Typing paused (you clicked).  Click where it should continue, "
+                             "then Space to resume.  F9 = stop.")
         return
     if state["click_ours"]:                      # clicks in the chat window keep the selection info
         return
