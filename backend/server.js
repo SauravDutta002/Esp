@@ -269,6 +269,19 @@ const server = http.createServer(async (req, res) => {
 
       const id = slug(name);
       if (!id) return send(res, 400, { error: "name has no letters or digits" });
+
+      // Same board (same MAC) under a new name, e.g. DEVICE_NAME was changed in esp.ino:
+      // drop the old entry so the board is listed only once, under its new name.
+      const mac = String(b.mac || "").trim().slice(0, 32);
+      if (mac) {
+        for (const [otherId, d] of Object.entries(devices)) {
+          if (otherId !== id && d.mac && d.mac.toLowerCase() === mac.toLowerCase()) {
+            console.log(`${d.name} is now called ${name}: old entry removed`);
+            delete devices[otherId];
+          }
+        }
+      }
+
       if (!devices[id] && Object.keys(devices).length >= MAX_DEVICES) return send(res, 507, { error: "too many devices" });
 
       const old = devices[id];
@@ -279,7 +292,7 @@ const server = http.createServer(async (req, res) => {
         ip,
         ssid: String(b.ssid || "").slice(0, 64),
         rssi: Number.isFinite(+b.rssi) ? +b.rssi : null,
-        mac: String(b.mac || "").slice(0, 32),
+        mac,
         ble: !!b.ble,
         uptimeSec: Number.isFinite(+b.uptime) ? +b.uptime : null,
         firstSeen: old ? old.firstSeen : now,
